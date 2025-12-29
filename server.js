@@ -15,12 +15,15 @@ console.log("WebSocket server running on port", PORT);
  */
 const rooms = {};
 
+// ---------------- HEARTBEAT ----------------
 function heartbeat() {
     this.isAlive = true;
 }
 
+// ---------------- CONNECTION ----------------
 wss.on("connection", (ws) => {
     ws.isAlive = true;
+    ws.currentRoom = null;
     ws.on("pong", heartbeat);
 
     ws.on("message", (msg) => {
@@ -43,18 +46,31 @@ wss.on("connection", (ws) => {
         }
 
         const roomObj = rooms[room];
-        roomObj.clients.add(ws);
 
-        if (type === "ping") {
-            ws.send(JSON.stringify({ type: "pong" }));
-            return;
+        // ---- JOIN ROOM (first message defines room) ----
+        if (!ws.currentRoom) {
+            ws.currentRoom = room;
+            roomObj.clients.add(ws);
+
+            console.log(`Client joined room ${room}`);
+
+            // 🔑 CRITICAL FIX:
+            // Always send authoritative state immediately on join
+            if (roomObj.gameState) {
+                ws.send(JSON.stringify({
+                    type: "state",
+                    room,
+                    state: roomObj.gameState
+                }));
+            }
         }
 
+        // ---- STATE UPDATE (authoritative) ----
         if (type === "state") {
             roomObj.gameState = data.state;
 
             roomObj.clients.forEach(client => {
-                if (client !== ws && client.readyState === WebSocket.OPEN) {
+                if (client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify({
                         type: "state",
                         room,
@@ -63,8 +79,10 @@ wss.on("connection", (ws) => {
                     }));
                 }
             });
+            return;
         }
 
+        // ---- CHAT ----
         if (type === "chat") {
             roomObj.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
@@ -76,23 +94,31 @@ wss.on("connection", (ws) => {
                     }));
                 }
             });
+            return;
         }
     });
 
     ws.on("close", () => {
-        for (const roomId in rooms) {
-            rooms[roomId].clients.delete(ws);
-            if (rooms[roomId].clients.size === 0) {
-                delete rooms[roomId];
-            }
+        const room = ws.currentRoom;
+        if (!room || !rooms[room]) return;
+
+        rooms[room].clients.delete(ws);
+        console.log(`Client left room ${room}`);
+
+        if (rooms[room].clients.size === 0) {
+            delete rooms[room];
+            console.log(`Room ${room} destroyed`);
         }
     });
 });
 
-// --- heartbeat cleanup ---
+// ---------------- HEARTBEAT CLEANUP ----------------
 setInterval(() => {
     wss.clients.forEach(ws => {
-        if (!ws.isAlive) return ws.terminate();
+        if (!ws.isAlive) {
+            console.log("Terminating dead connection");
+            return ws.terminate();
+        }
         ws.isAlive = false;
         ws.ping();
     });
