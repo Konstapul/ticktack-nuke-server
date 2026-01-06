@@ -9,7 +9,8 @@ console.log("WebSocket server running on port", PORT);
  * rooms = {
  *   ROOM_ID: {
  *     clients: Set<WebSocket>,
- *     gameState: Object | null
+ *     players: { 1: ws|null, 2: ws|null },
+ *     gameState: Object
  *   }
  * }
  */
@@ -20,10 +21,18 @@ function heartbeat() {
     this.isAlive = true;
 }
 
+// ---------------- GAME REDUCER (STUB) ----------------
+// IMPORTANT: real logic still lives client-side for now
+// Server enforces TURN ONLY
+function applyAction(state, action) {
+    return action.nextState;
+}
+
 // ---------------- CONNECTION ----------------
 wss.on("connection", (ws) => {
     ws.isAlive = true;
-    ws.currentRoom = null;
+    ws.room = null;
+    ws.playerId = null;
     ws.on("pong", heartbeat);
 
     ws.on("message", (msg) => {
@@ -37,48 +46,80 @@ wss.on("connection", (ws) => {
         const { type, room } = data;
         if (!room) return;
 
-        // Create room if missing
+        // ---- CREATE ROOM IF NEEDED ----
         if (!rooms[room]) {
             rooms[room] = {
                 clients: new Set(),
+                players: { 1: null, 2: null },
                 gameState: null
             };
         }
 
         const roomObj = rooms[room];
 
-        // ---- JOIN ROOM (first message defines room) ----
-        if (!ws.currentRoom) {
-            ws.currentRoom = room;
+        // ---- JOIN ROOM ----
+        if (!ws.room) {
+            ws.room = room;
             roomObj.clients.add(ws);
 
-            console.log(`Client joined room ${room}`);
+            // Assign player slot
+            if (!roomObj.players[1]) {
+                roomObj.players[1] = ws;
+                ws.playerId = 1;
+            } else if (!roomObj.players[2]) {
+                roomObj.players[2] = ws;
+                ws.playerId = 2;
+            } else {
+                ws.playerId = 0; // spectator
+            }
 
-            // 🔑 CRITICAL FIX:
-            // Always send authoritative state immediately on join
+            ws.send(JSON.stringify({
+                type: "role",
+                playerId: ws.playerId
+            }));
+
             if (roomObj.gameState) {
                 ws.send(JSON.stringify({
                     type: "state",
-                    room,
                     state: roomObj.gameState
                 }));
             }
+
+            console.log(`Client joined ${room} as P${ws.playerId}`);
+            return;
         }
 
-        // ---- STATE UPDATE (authoritative) ----
-        if (type === "state") {
-            roomObj.gameState = data.state;
+        // ---- ACTION (AUTHORITATIVE TURN CHECK) ----
+        if (type === "action") {
+            if (!roomObj.gameState) return;
 
+            const current = roomObj.gameState.currentPlayer;
+
+            // Reject illegal turn
+            if (ws.playerId !== current) {
+                ws.send(JSON.stringify({
+                    type: "error",
+                    msg: "Not your turn"
+                }));
+                return;
+            }
+
+            // Apply action
+            roomObj.gameState = applyAction(
+                roomObj.gameState,
+                data.action
+            );
+
+            // Broadcast authoritative state
             roomObj.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify({
                         type: "state",
-                        room,
-                        sender: data.sender,
                         state: roomObj.gameState
                     }));
                 }
             });
+
             return;
         }
 
@@ -88,24 +129,25 @@ wss.on("connection", (ws) => {
                 if (client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify({
                         type: "chat",
-                        room,
                         msg: data.msg,
-                        role: data.role
+                        role: ws.playerId
                     }));
                 }
             });
-            return;
         }
     });
 
     ws.on("close", () => {
-        const room = ws.currentRoom;
+        const room = ws.room;
         if (!room || !rooms[room]) return;
 
-        rooms[room].clients.delete(ws);
-        console.log(`Client left room ${room}`);
+        const roomObj = rooms[room];
+        roomObj.clients.delete(ws);
 
-        if (rooms[room].clients.size === 0) {
+        if (roomObj.players[1] === ws) roomObj.players[1] = null;
+        if (roomObj.players[2] === ws) roomObj.players[2] = null;
+
+        if (roomObj.clients.size === 0) {
             delete rooms[room];
             console.log(`Room ${room} destroyed`);
         }
@@ -115,10 +157,7 @@ wss.on("connection", (ws) => {
 // ---------------- HEARTBEAT CLEANUP ----------------
 setInterval(() => {
     wss.clients.forEach(ws => {
-        if (!ws.isAlive) {
-            console.log("Terminating dead connection");
-            return ws.terminate();
-        }
+        if (!ws.isAlive) return ws.terminate();
         ws.isAlive = false;
         ws.ping();
     });
