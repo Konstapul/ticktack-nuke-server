@@ -1,6 +1,6 @@
 const WebSocket = require("ws");
 
-const PORT = process.env.PORT || 8080;
+const PORT = process.env.PORT || 10000;
 const wss = new WebSocket.Server({ port: PORT });
 
 console.log("WebSocket server running on port", PORT);
@@ -10,7 +10,7 @@ console.log("WebSocket server running on port", PORT);
  *   ROOM_ID: {
  *     clients: Set<WebSocket>,
  *     players: { 1: ws|null, 2: ws|null },
- *     gameState: Object
+ *     gameState: Object|null
  *   }
  * }
  */
@@ -21,24 +21,18 @@ function heartbeat() {
     this.isAlive = true;
 }
 
-// ---------------- GAME REDUCER (STUB) ----------------
-// IMPORTANT: real logic still lives client-side for now
-// Server enforces TURN ONLY
-function applyAction(state, action) {
-    return action.nextState;
-}
-
 // ---------------- CONNECTION ----------------
 wss.on("connection", (ws) => {
     ws.isAlive = true;
     ws.room = null;
     ws.playerId = null;
+
     ws.on("pong", heartbeat);
 
-    ws.on("message", (msg) => {
+    ws.on("message", (raw) => {
         let data;
         try {
-            data = JSON.parse(msg);
+            data = JSON.parse(raw);
         } catch {
             return;
         }
@@ -46,7 +40,7 @@ wss.on("connection", (ws) => {
         const { type, room } = data;
         if (!room) return;
 
-        // ---- CREATE ROOM IF NEEDED ----
+        // ---------- CREATE ROOM ----------
         if (!rooms[room]) {
             rooms[room] = {
                 clients: new Set(),
@@ -57,12 +51,12 @@ wss.on("connection", (ws) => {
 
         const roomObj = rooms[room];
 
-        // ---- JOIN ROOM ----
+        // ---------- JOIN ROOM ----------
         if (!ws.room) {
             ws.room = room;
             roomObj.clients.add(ws);
 
-            // Assign player slot
+            // Assign player slots
             if (!roomObj.players[1]) {
                 roomObj.players[1] = ws;
                 ws.playerId = 1;
@@ -78,6 +72,7 @@ wss.on("connection", (ws) => {
                 playerId: ws.playerId
             }));
 
+            // Send authoritative state if exists
             if (roomObj.gameState) {
                 ws.send(JSON.stringify({
                     type: "state",
@@ -89,14 +84,15 @@ wss.on("connection", (ws) => {
             return;
         }
 
-        // ---- ACTION (AUTHORITATIVE TURN CHECK) ----
-        if (type === "action") {
-            if (!roomObj.gameState) return;
+        // ---------- STATE UPDATE ----------
+        // Client-authoritative: server accepts state,
+        // but enforces turn ownership.
+        if (type === "state") {
+            const incoming = data.state;
+            if (!incoming || typeof incoming.currentPlayer !== "number") return;
 
-            const current = roomObj.gameState.currentPlayer;
-
-            // Reject illegal turn
-            if (ws.playerId !== current) {
+            // Enforce turn
+            if (ws.playerId !== incoming.lastMover) {
                 ws.send(JSON.stringify({
                     type: "error",
                     msg: "Not your turn"
@@ -104,13 +100,10 @@ wss.on("connection", (ws) => {
                 return;
             }
 
-            // Apply action
-            roomObj.gameState = applyAction(
-                roomObj.gameState,
-                data.action
-            );
+            // Accept authoritative state
+            roomObj.gameState = incoming;
 
-            // Broadcast authoritative state
+            // Broadcast to ALL clients (including sender)
             roomObj.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
                     client.send(JSON.stringify({
@@ -123,7 +116,7 @@ wss.on("connection", (ws) => {
             return;
         }
 
-        // ---- CHAT ----
+        // ---------- CHAT ----------
         if (type === "chat") {
             roomObj.clients.forEach(client => {
                 if (client.readyState === WebSocket.OPEN) {
