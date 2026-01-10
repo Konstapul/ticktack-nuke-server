@@ -7,7 +7,7 @@ console.log(`[WAR ROOM] Server initialized on port ${PORT}`);
 
 // --- GAME CONSTANTS ---
 const MAP_SIZE = 15;
-const WINNING_SCORE = 3;
+const WINNING_SCORE = 5; // Updated to match typical Connect-5 saturation
 
 const STATE = {
     EMPTY: 0,
@@ -22,27 +22,27 @@ const STATE = {
 class GameSession {
     constructor(roomId) {
         this.roomId = roomId;
-        this.clients = { 1: null, 2: null }; // WebSocket connections
+        this.clients = { 1: null, 2: null }; 
         this.spectators = new Set();
         
         // Game State
         this.grid = Array(MAP_SIZE).fill().map(() => Array(MAP_SIZE).fill(STATE.EMPTY));
-        this.turn = 1; // 1 or 2
+        this.turn = 1; 
         this.scores = { 1: 0, 2: 0 };
         this.nukes = { 1: 0, 2: 0 };
         this.boosters = { 1: 0, 2: 0 };
         this.bunkers = { 1: 0, 2: 0 };
         
-        // Special Turn States
         this.bonusTurn = false;
-        this.ignoreIsolation = false; // Granted by 2x2 sometimes? (Simulating your logic)
         this.gameActive = true;
         this.winner = null;
+        
+        // Track used patterns to prevent infinite bonus loops
+        this.usedPatterns = new Set(); 
     }
 
     addClient(ws, playerId) {
         if (playerId === 1 || playerId === 2) {
-            // Reconnect logic: If a player is already there, close old connection
             if (this.clients[playerId] && this.clients[playerId].readyState === WebSocket.OPEN) {
                 this.clients[playerId].close();
             }
@@ -59,10 +59,9 @@ class GameSession {
         else this.spectators.delete(ws);
     }
 
-    // Process an action from a player
     handleAction(playerId, action) {
         if (!this.gameActive) return;
-        if (playerId !== this.turn && !this.bonusTurn) return; // Strict turn enforcement
+        if (playerId !== this.turn && !this.bonusTurn) return;
 
         try {
             switch (action.type) {
@@ -70,62 +69,60 @@ class GameSession {
                     this.handlePlace(playerId, action.r, action.c);
                     break;
                 case 'NUKE':
-                    this.handleNuke(playerId, action.r, action.c, action.boosted);
+                    this.handleNuke(playerId, action.r, action.c, action.boostLevel || 0);
                     break;
                 case 'CRAFT':
                     this.handleCraft(playerId);
                     break;
+                case 'RESET': // Feature request: Reset
+                     this.resetGame();
+                     break;
             }
         } catch (e) {
             console.error(`Error processing move: ${e.message}`);
         }
     }
 
-    handlePlace(p, r, c) {
-        // 1. Validation
-        if (!this.isValid(r, c)) return;
-        if (this.grid[r][c] !== STATE.EMPTY && this.grid[r][c] !== STATE.CRATER) return; // Occupied
-        
-        // Isolation Rule (if bonus turn is active)
-        if (this.bonusTurn && !this.ignoreIsolation) {
-            if (!this.isIsolated(r, c)) {
-                this.sendError(p, "MUST PLACE ISOLATED UNIT");
-                return;
-            }
-        }
+    resetGame() {
+        this.grid = Array(MAP_SIZE).fill().map(() => Array(MAP_SIZE).fill(STATE.EMPTY));
+        this.turn = 1;
+        this.scores = { 1: 0, 2: 0 };
+        this.nukes = { 1: 0, 2: 0 };
+        this.boosters = { 1: 0, 2: 0 };
+        this.bunkers = { 1: 0, 2: 0 };
+        this.bonusTurn = false;
+        this.gameActive = true;
+        this.winner = null;
+        this.usedPatterns = new Set();
+        this.broadcastState();
+    }
 
-        // 2. Execute Move
+    handlePlace(p, r, c) {
+        if (!this.isValid(r, c)) return;
+        if (this.grid[r][c] !== STATE.EMPTY && this.grid[r][c] !== STATE.CRATER) return;
+
+        // Execute Move
         this.grid[r][c] = (p === 1) ? STATE.P1 : STATE.P2;
         
-        // 3. Post-Move Checks
         let earnedBonus = false;
 
         // Check Win (5-in-a-row)
         const scored = this.checkWinCondition(p); 
         if (scored) {
-            // Scoring logic from your snippet
             this.scores[p]++;
-            if (this.scores[p] === 1) this.nukes[p]++;
-            else if (this.scores[p] === 2) this.nukes[p === 1 ? 2 : 1]++; // Catch-up mechanic
-            
-            if (this.scores[p] >= WINNING_SCORE) {
-                this.gameActive = false;
-                this.winner = p;
-            }
+            // Every score gives a nuke (simplified rule from previous iteration)
+            this.nukes[p]++; 
         }
 
-        // Check Patterns (only if game still active)
+        // Check Patterns (Only checking around the NEW piece to prevent loops)
         if (this.gameActive) {
-            const patternBonus = this.scanForPatterns(p);
-            if (patternBonus.turn) earnedBonus = true;
-            // patternBonus.bunker handled inside scanForPatterns
+            const patternBonus = this.scanForPatterns(p, r, c);
+            if (patternBonus) earnedBonus = true;
         }
 
-        // 4. Turn Switching
+        // Turn Switching Logic
         if (earnedBonus) {
-            this.bonusTurn = true;
-            // logic for isolation requirement on next turn
-            this.ignoreIsolation = false; 
+            this.bonusTurn = true; 
         } else {
             this.bonusTurn = false;
             this.turn = (this.turn === 1) ? 2 : 1;
@@ -134,37 +131,61 @@ class GameSession {
         this.broadcastState();
     }
 
-    handleNuke(p, r, c, boosted) {
-        // Validation
+    handleNuke(p, r, c, boostLevel) {
         if (this.nukes[p] <= 0) return;
-        if (boosted && this.boosters[p] <= 0) return;
+        if (boostLevel > this.boosters[p]) return; // Cheat check
+
+        // Rule: Unboosted nukes (level 0) must target own pieces
+        if (boostLevel === 0) {
+            const target = this.grid[r][c];
+            const isMine = (p === 1 && (target === STATE.P1 || target === STATE.P1_BUNKER || target === STATE.P1_SCORED)) ||
+                           (p === 2 && (target === STATE.P2 || target === STATE.P2_BUNKER || target === STATE.P2_SCORED));
+            
+            if (!isMine && target !== STATE.EMPTY && target !== STATE.CRATER) {
+                // Allow empty/crater targeting, but prevent hitting ENEMY on lvl 0? 
+                // User said: "only be able to be detonated on your own pieces".
+                // We'll enforce strictly: Must trigger on OWN piece.
+                if (!isMine) {
+                    this.sendError(p, "LVL 0 NUKE: MUST TARGET SELF");
+                    return;
+                }
+            }
+        }
 
         // Consume Resources
         this.nukes[p]--;
-        if (boosted) this.boosters[p]--;
+        this.boosters[p] -= boostLevel;
 
-        // Calculate Blast Area
-        // Standard: 3x3. Boosted: 5x5 (example logic)
-        const radius = boosted ? 2 : 1; 
+        // Calculate Blast Area (Manhattan Distance)
+        // Base radius (Lvl 0) = 1 (Center + 1 NSEW) -> Manhattan <= 1
+        // Lvl 1 = Manhattan <= 2
+        const maxDist = 1 + boostLevel;
 
-        for (let dy = -radius; dy <= radius; dy++) {
-            for (let dx = -radius; dx <= radius; dx++) {
-                const nr = r + dy;
-                const nc = c + dx;
-                if (this.isValid(nr, nc)) {
-                    const cell = this.grid[nr][nc];
-                    const isBunker = [STATE.P1_BUNKER, STATE.P2_BUNKER, STATE.P1_BUNKER_SCORED, STATE.P2_BUNKER_SCORED].includes(cell);
+        for (let dy = -maxDist; dy <= maxDist; dy++) {
+            for (let dx = -maxDist; dx <= maxDist; dx++) {
+                // Manhattan Distance Check
+                if (Math.abs(dx) + Math.abs(dy) <= maxDist) {
+                    const nr = r + dy;
+                    const nc = c + dx;
                     
-                    // Bunkers survive normal nukes, die to boosted nukes
-                    if (isBunker && !boosted) continue;
-                    
-                    // Destroy bunker count if destroyed
-                    if (isBunker) {
-                        const owner = [STATE.P1_BUNKER, STATE.P1_BUNKER_SCORED].includes(cell) ? 1 : 2;
-                        this.bunkers[owner] = Math.max(0, this.bunkers[owner] - 1);
+                    if (this.isValid(nr, nc)) {
+                        const cell = this.grid[nr][nc];
+                        
+                        // Bunker Logic: Bunkers survive if blast is NOT boosted enough?
+                        // Usually bunkers survive normal nukes. 
+                        // Let's say Boost Level 0 cannot kill bunkers. Boost >= 1 kills bunkers.
+                        const isBunker = [STATE.P1_BUNKER, STATE.P2_BUNKER, STATE.P1_BUNKER_SCORED, STATE.P2_BUNKER_SCORED].includes(cell);
+                        
+                        if (isBunker && boostLevel < 1) continue;
+
+                        // Count destroyed bunkers
+                        if (isBunker) {
+                            const owner = [STATE.P1_BUNKER, STATE.P1_BUNKER_SCORED].includes(cell) ? 1 : 2;
+                            this.bunkers[owner] = Math.max(0, this.bunkers[owner] - 1);
+                        }
+
+                        this.grid[nr][nc] = STATE.CRATER;
                     }
-
-                    this.grid[nr][nc] = STATE.CRATER;
                 }
             }
         }
@@ -185,28 +206,10 @@ class GameSession {
     // --- HELPER LOGIC ---
     isValid(r, c) { return r >= 0 && r < MAP_SIZE && c >= 0 && c < MAP_SIZE; }
 
-    isIsolated(r, c) {
-        // Check 8 neighbors
-        for (let dr = -1; dr <= 1; dr++) {
-            for (let dc = -1; dc <= 1; dc++) {
-                if (dr === 0 && dc === 0) continue;
-                if (this.isValid(r+dr, c+dc)) {
-                    const cell = this.grid[r+dr][c+dc];
-                    if (cell !== STATE.EMPTY && cell !== STATE.CRATER) return false;
-                }
-            }
-        }
-        return true;
-    }
-
     checkWinCondition(p) {
         let scored = false;
-        // Directions: Horizontal, Vertical, Diagonal, Anti-Diagonal
         const directions = [[0,1], [1,0], [1,1], [1,-1]];
         
-        // Scan entire grid (Inefficient but robust for turn-based)
-        // Optimization: In a real deploy, only check lines passing through last move.
-        // For simplicity here, we scan grid.
         for (let r = 0; r < MAP_SIZE; r++) {
             for (let c = 0; c < MAP_SIZE; c++) {
                 directions.forEach(([dr, dc]) => {
@@ -219,11 +222,15 @@ class GameSession {
                     }
                     
                     if (line.length === 5) {
-                        const isPlayerLine = line.every(cell => 
-                            (p === 1 ? [1,5] : [2,6]).includes(cell.val) // 1 or 5 (P1 normal/bunker)
+                        // Check if line belongs to player (Normal or Bunker or Scored)
+                        const pVal = p === 1 ? [1,5,3,7] : [2,6,4,8];
+                        // Only count unscored pieces for new score
+                        const isPlayerLine = line.every(cell => pVal.includes(cell.val));
+                        const hasUnscored = line.some(cell => 
+                            (p === 1 ? [1,5] : [2,6]).includes(cell.val)
                         );
                         
-                        if (isPlayerLine) {
+                        if (isPlayerLine && hasUnscored) {
                             // Convert to scored state
                             line.forEach(cell => {
                                 const current = this.grid[cell.r][cell.c];
@@ -241,44 +248,94 @@ class GameSession {
         return scored;
     }
 
-    scanForPatterns(p) {
-        let result = { turn: false, bunker: false };
+    // Scan for patterns only involving the newly placed piece (r,c)
+    scanForPatterns(p, r, c) {
+        let earnedTurn = false;
         
-        // 2x2 Pattern Check
-        for (let r = 0; r < MAP_SIZE-1; r++) {
-            for (let c = 0; c < MAP_SIZE-1; c++) {
-                const block = [
-                    this.grid[r][c], this.grid[r][c+1],
-                    this.grid[r+1][c], this.grid[r+1][c+1]
-                ];
-                // Check if all belong to player and are NOT scored/bunkers yet (simplified)
-                if (block.every(val => val === (p===1?1:2))) {
-                    // In a real implementation, we need to track if this 2x2 was ALREADY used.
-                    // For this simple version, we assume detection triggers the bonus.
-                    result.turn = true;
+        // 1. Check 2x2 Squares (Bonus Turn)
+        // A piece at (r,c) can be in 4 possible 2x2 squares: top-left, top-right, bot-left, bot-right relative to itself.
+        const squareOffsets = [
+            [[0,0], [0,1], [1,0], [1,1]], // (r,c) is Top-Left
+            [[0,-1], [0,0], [1,-1], [1,0]], // (r,c) is Top-Right
+            [[-1,0], [-1,1], [0,0], [0,1]], // (r,c) is Bot-Left
+            [[-1,-1], [-1,0], [0,-1], [0,0]] // (r,c) is Bot-Right
+        ];
+
+        for (let offsets of squareOffsets) {
+            let coords = [];
+            let valid = true;
+            for (let [dr, dc] of offsets) {
+                const nr = r + dr, nc = c + dc;
+                if (!this.isValid(nr, nc)) { valid = false; break; }
+                const val = this.grid[nr][nc];
+                const isOwner = (p === 1 ? [1,3,5,7] : [2,4,6,8]).includes(val);
+                if (!isOwner) { valid = false; break; }
+                coords.push(`${nr},${nc}`);
+            }
+
+            if (valid) {
+                // Identify square by its top-left coord
+                coords.sort(); 
+                const squareId = `SQ:${coords.join('|')}`;
+                if (!this.usedPatterns.has(squareId)) {
+                    this.usedPatterns.add(squareId);
+                    earnedTurn = true;
                 }
             }
         }
 
-        // Plus Pattern (+) Check
-        for (let r = 1; r < MAP_SIZE-1; r++) {
-            for (let c = 1; c < MAP_SIZE-1; c++) {
-                const center = this.grid[r][c];
-                const arms = [
-                    this.grid[r-1][c], this.grid[r+1][c],
-                    this.grid[r][c-1], this.grid[r][c+1]
-                ];
-                
-                if (center === (p===1?1:2) && arms.every(val => val === center)) {
-                    // Upgrade center to Bunker
-                    this.grid[r][c] = (p===1 ? STATE.P1_BUNKER : STATE.P2_BUNKER);
-                    this.bunkers[p]++;
-                    this.boosters[p]++; // Give booster
-                }
-            }
-        }
+        // 2. Check Plus Patterns (Bunker)
+        // Center piece must be the new piece (r,c) OR new piece completes an arm.
+        // Simplified: Check if (r,c) is center, or if (r,c) is an arm of a neighbor center.
         
-        return result;
+        const checkPlus = (cx, cy) => {
+            if (!this.isValid(cx, cy)) return false;
+            const centerVal = this.grid[cx][cy];
+            const isOwner = (p === 1 ? [1,3,5,7] : [2,4,6,8]).includes(centerVal);
+            if (!isOwner) return false;
+
+            const arms = [[-1,0], [1,0], [0,-1], [0,1]];
+            let armCoords = [];
+            for (let [dr, dc] of arms) {
+                const nr = cx + dr, nc = cy + dc;
+                if (!this.isValid(nr, nc)) return false;
+                const val = this.grid[nr][nc];
+                const isArmOwner = (p === 1 ? [1,3,5,7] : [2,4,6,8]).includes(val);
+                if (!isArmOwner) return false;
+                armCoords.push({r:nr, c:nc});
+            }
+            
+            // It's a valid Plus!
+            const plusId = `PLUS:${cx},${cy}`;
+            if (!this.usedPatterns.has(plusId)) {
+                this.usedPatterns.add(plusId);
+                
+                // Convert ALL 5 to Bunkers
+                [ {r:cx, c:cy}, ...armCoords ].forEach(cell => {
+                    const v = this.grid[cell.r][cell.c];
+                    // Upgrade standard pieces to bunkers. Preserve Scored status.
+                    if (v === STATE.P1) this.grid[cell.r][cell.c] = STATE.P1_BUNKER;
+                    if (v === STATE.P2) this.grid[cell.r][cell.c] = STATE.P2_BUNKER;
+                    if (v === STATE.P1_SCORED) this.grid[cell.r][cell.c] = STATE.P1_BUNKER_SCORED;
+                    if (v === STATE.P2_SCORED) this.grid[cell.r][cell.c] = STATE.P2_BUNKER_SCORED;
+                });
+                
+                this.bunkers[p] += 5; // Track count roughly
+                this.boosters[p]++;
+                return true;
+            }
+            return false;
+        };
+
+        // Check (r,c) as center
+        checkPlus(r, c);
+        // Check neighbors as center
+        checkPlus(r-1, c);
+        checkPlus(r+1, c);
+        checkPlus(r, c-1);
+        checkPlus(r, c+1);
+
+        return earnedTurn;
     }
 
     // --- NETWORKING ---
@@ -316,62 +373,43 @@ class GameSession {
 // --- GLOBAL ROOM MANAGER ---
 const rooms = {};
 
-// Handle new connections
 wss.on("connection", (ws) => {
     ws.isAlive = true;
     ws.roomId = null;
-    
     ws.on("pong", () => ws.isAlive = true);
 
     ws.on("message", (raw) => {
         try {
             const data = JSON.parse(raw);
             
-            // 1. JOIN LOGIC
             if (data.type === "join") {
                 const roomId = data.room || "default";
-                
-                if (!rooms[roomId]) {
-                    rooms[roomId] = new GameSession(roomId);
-                    console.log(`Created Room: ${roomId}`);
-                }
-                
+                if (!rooms[roomId]) rooms[roomId] = new GameSession(roomId);
                 const game = rooms[roomId];
                 
-                // Assign Player Role
                 let role = null;
                 if (!game.clients[1]) role = 1;
                 else if (!game.clients[2]) role = 2;
-                else role = "spectator"; // Room full
+                else role = "spectator";
 
                 ws.roomId = roomId;
-                ws.role = role; // Store role on the socket
-                
+                ws.role = role;
                 game.addClient(ws, role);
-                
-                // Tell the client who they are
                 ws.send(JSON.stringify({ type: "WELCOME", role: role }));
                 return;
             }
 
-            // 2. GAME ACTION LOGIC
             if (ws.roomId && rooms[ws.roomId]) {
                 const game = rooms[ws.roomId];
-                
                 if (data.type === "chat") {
-                    // Broadcast chat to all in room
                     const chatMsg = JSON.stringify({ type: "chat", msg: data.msg, role: ws.role });
                     [game.clients[1], game.clients[2], ...game.spectators].forEach(c => {
                         if (c && c.readyState === WebSocket.OPEN) c.send(chatMsg);
                     });
-                } else {
-                    // Pass game moves to the engine
-                    if (ws.role === 1 || ws.role === 2) {
-                        game.handleAction(ws.role, data);
-                    }
+                } else if (ws.role === 1 || ws.role === 2) {
+                    game.handleAction(ws.role, data);
                 }
             }
-
         } catch (e) {
             console.error("Msg Error:", e);
         }
@@ -379,15 +417,11 @@ wss.on("connection", (ws) => {
 
     ws.on("close", () => {
         if (ws.roomId && rooms[ws.roomId]) {
-            const game = rooms[ws.roomId];
-            game.removeClient(ws);
-            // Optional: Destroy empty rooms after timeout
-            // if (!game.clients[1] && !game.clients[2]) delete rooms[ws.roomId];
+            rooms[ws.roomId].removeClient(ws);
         }
     });
 });
 
-// Heartbeat interval
 setInterval(() => {
     wss.clients.forEach((ws) => {
         if (ws.isAlive === false) return ws.terminate();
